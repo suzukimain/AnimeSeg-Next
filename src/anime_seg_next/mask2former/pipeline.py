@@ -133,9 +133,10 @@ class AnimeSegNextPipeline:
         if not filename:
             # Try to get from config_obj["models"] list
             if config_obj and "models" in config_obj and isinstance(config_obj["models"], list):
-                # Use the first one (usually latest if updated via update_hf_config.py)
-                models = config_obj["models"]
-                if models and isinstance(models[0], dict):
+                # Sort by Version (descending) and pick the latest
+                models = [m for m in config_obj["models"] if isinstance(m, dict)]
+                if models:
+                    models.sort(key=lambda x: int(x.get("Version", 0)), reverse=True)
                     filename = models[0].get("FilePath")
 
             # Fallback: scan repo files for latest version based on naming convention
@@ -428,7 +429,10 @@ def _resolve_latest_local(dir_path: str, config_path: Optional[str]) -> str:
             with open(config_path, encoding="utf-8") as f:
                 data = json.load(f)
                 if "models" in data and isinstance(data["models"], list) and data["models"]:
-                    rel_path = data["models"][0].get("FilePath")
+                    # Sort by Version (descending) and pick the latest
+                    models = [m for m in data["models"] if isinstance(m, dict)]
+                    models.sort(key=lambda x: int(x.get("Version", 0)), reverse=True)
+                    rel_path = models[0].get("FilePath")
                     if rel_path:
                         # Check various potential locations for the file
                         candidates = [
