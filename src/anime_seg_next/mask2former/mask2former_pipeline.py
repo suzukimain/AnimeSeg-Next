@@ -8,8 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from anime_seg.mask2former.mask2former_pipeline import Mask2FormerAnimeSegPipeline
-
+from .mask2former_model import Mask2FormerAnimeSegModel
 from ..types import AnimeSegOutput
 from ..core import SERIES_CLASS_MAP, build_semantic_colors, resolve_series
 
@@ -119,6 +118,13 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         config_name: str = "config.json",
         remove_bg: bool = False,
     ) -> None:
+        # We need to bypass the parent's model initialization to use our own model class
+        # but we still want the parent's utility methods.
+        # So we call parent __init__ but we'll override the model implementation.
+        
+        # Actually, it's cleaner to just copy the init logic or carefully override the model loading.
+        # Since we want to use our local Mask2FormerAnimeSegModel, we'll override the model attribute.
+        
         super().__init__(
             repo_id=repo_id,
             filename=filename,
@@ -128,6 +134,33 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
             config_name=config_name,
             remove_bg=remove_bg,
         )
+        
+        # After parent init, the model is loaded using the parent's model class.
+        # We RE-LOAD it using our local model class to enable depth support.
+        # This is slightly redundant but safe.
+        
+        # We need to find the checkpoint path again.
+        # Parent stores it in self.model if we're lucky, but usually it's just the state dict.
+        # Let's find where the parent stores the model. It's self.model.
+        
+        # Re-resolve meta to get checkpoint path
+        model_meta = self._resolve_model_meta(repo_id, token, filename, config_name)
+        selected_filename = filename or str(model_meta.get("FilePath", "") if model_meta else "")
+        local_path = self._resolve_local_checkpoint_path(selected_filename)
+        checkpoint_path = local_path if local_path else self._download_hf_file(repo_id, selected_filename, token)
+        
+        merged_full = bool((model_meta.get("Config", {}) or {}).get("merged_full", False))
+        inferred_merged = self._infer_merged_full_from_checkpoint(checkpoint_path)
+        effective_merged = merged_full or inferred_merged
+        
+        self.model = Mask2FormerAnimeSegModel(
+            base_model=str(model_meta.get("BaseModel", base_model)),
+            num_classes=self.num_classes,
+            load_base_pretrained=not effective_merged
+        )
+        self.model.load_checkpoint(checkpoint_path)
+        self.model.to(self.device)
+        self.model.eval()
 
     @classmethod
     def from_mask2former(

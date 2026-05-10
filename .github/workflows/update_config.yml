@@ -1,11 +1,11 @@
 name: Update HF config.json
 
 # Triggers:
-#  1. Automatic — when *.safetensors files are pushed to main
+#  1. Automatic — when *.safetensors files are pushed to master
 #  2. Manual    — workflow_dispatch with explicit checkpoint name
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "models/*.safetensors"
 
