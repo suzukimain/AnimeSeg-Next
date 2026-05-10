@@ -118,24 +118,7 @@ class AnimeSegNextPipeline:
 
         final_token = hf_token or token
 
-        if not filename:
-            try:
-                files = list(list_repo_files(repo_id, token=final_token))
-                safetensors = [f for f in files if f.endswith(".safetensors")]
-                if not safetensors:
-                    raise RuntimeError(
-                        f"No .safetensors files found in repo {repo_id!r}"
-                    )
-                filename = safetensors[-1]
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to list files in repo {repo_id!r}: {exc}"
-                ) from exc
-
-        ckpt_path = hf_hub_download(
-            repo_id=repo_id, filename=filename, token=final_token
-        )
-
+        # 1. Download config first to potentially guide model selection
         config_obj: Optional[Dict] = None
         try:
             cfg_path = hf_hub_download(
@@ -145,6 +128,36 @@ class AnimeSegNextPipeline:
                 config_obj = json.load(f)
         except Exception:
             pass
+
+        # 2. Determine filename if not provided
+        if not filename:
+            # Try to get from config_obj["models"] list
+            if config_obj and "models" in config_obj and isinstance(config_obj["models"], list):
+                # Use the first one (usually latest if updated via update_hf_config.py)
+                models = config_obj["models"]
+                if models and isinstance(models[0], dict):
+                    filename = models[0].get("FilePath")
+
+            # Fallback: scan repo files for latest version based on naming convention
+            if not filename:
+                try:
+                    files = list(list_repo_files(repo_id, token=final_token))
+                    safetensors = [f for f in files if f.endswith(".safetensors")]
+                    if not safetensors:
+                        raise RuntimeError(
+                            f"No .safetensors files found in repo {repo_id!r}"
+                        )
+                    filename = _pick_latest_filename(safetensors)
+                except Exception as exc:
+                    if not filename:
+                        raise RuntimeError(
+                            f"Failed to determine model file in repo {repo_id!r}: {exc}"
+                        ) from exc
+
+        # 3. Download the actual checkpoint
+        ckpt_path = hf_hub_download(
+            repo_id=repo_id, filename=filename, token=final_token
+        )
 
         return cls._build(
             ckpt_path=ckpt_path,
@@ -175,13 +188,25 @@ class AnimeSegNextPipeline:
         """Load from a local .safetensors or .pt file.
 
         Args:
-            checkpoint_path: Path to the model weights file.
+            checkpoint_path: Path to the model weights file or directory.
             config_path: Optional path to config.json with class metadata.
             base_model: Swin backbone HF ID for architecture initialisation.
             input_size: Square input resolution fed to the model.
             device: Target device.
             remove_bg: Apply ISNet background removal before segmentation (default: True).
         """
+        # 1. Handle directory input (auto-resolve latest)
+        if os.path.isdir(checkpoint_path):
+            dir_path = checkpoint_path
+            if not config_path:
+                potential_cfg = os.path.join(dir_path, "config.json")
+                if os.path.isfile(potential_cfg):
+                    config_path = potential_cfg
+            
+            # Resolve latest checkpoint from directory
+            checkpoint_path = _resolve_latest_local(dir_path, config_path)
+
+        # 2. Load config
         config_obj: Optional[Dict] = None
         if config_path and os.path.isfile(config_path):
             with open(config_path, encoding="utf-8") as f:
@@ -379,3 +404,51 @@ def _infer_num_classes(ckpt_path: str) -> int:
     except Exception:
         pass
     return 37
+
+
+def _pick_latest_filename(filenames: List[str]) -> str:
+    """Pick the filename with the highest _v{version} suffix."""
+    import re
+    ver_pattern = re.compile(r"_v(\d+)\.safetensors$")
+
+    def get_version(path: str) -> int:
+        match = ver_pattern.search(path)
+        return int(match.group(1)) if match else -1
+
+    # Sort descending by version
+    sorted_files = sorted(filenames, key=get_version, reverse=True)
+    return sorted_files[0]
+
+
+def _resolve_latest_local(dir_path: str, config_path: Optional[str]) -> str:
+    """Resolve the latest local checkpoint from a directory, using config if available."""
+    # 1. Try to use config.json metadata
+    if config_path and os.path.isfile(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                data = json.load(f)
+                if "models" in data and isinstance(data["models"], list) and data["models"]:
+                    rel_path = data["models"][0].get("FilePath")
+                    if rel_path:
+                        # Check various potential locations for the file
+                        candidates = [
+                            os.path.join(dir_path, os.path.basename(rel_path)),
+                            os.path.join(os.path.dirname(config_path), os.path.basename(rel_path)),
+                            os.path.join(dir_path, rel_path),
+                        ]
+                        for c in candidates:
+                            if os.path.isfile(c):
+                                return c
+        except Exception:
+            pass
+
+    # 2. Fallback: scan directory for .safetensors and pick highest version
+    files = [
+        f for f in os.listdir(dir_path) 
+        if f.endswith(".safetensors") and os.path.isfile(os.path.join(dir_path, f))
+    ]
+    if not files:
+        raise FileNotFoundError(f"No .safetensors files found in directory: {dir_path}")
+
+    latest_name = _pick_latest_filename(files)
+    return os.path.join(dir_path, latest_name)
