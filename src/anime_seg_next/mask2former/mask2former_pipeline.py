@@ -190,57 +190,64 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         # Build coloured mask
         h, w = preds.shape
         colored = np.zeros((h, w, 3), dtype=np.uint8)
-        # If model has 36 classes, prefer explicit 36-class palette
-        if getattr(self, "num_classes", None) == 36:
-            palette_36 = {
-                0: (0, 0, 0),
-                1: (75, 0, 130),
-                2: (0, 102, 204),
-                3: (100, 180, 220),
-                4: (220, 120, 80),
-                5: (70, 120, 200),
-                6: (220, 100, 40),
-                7: (50, 100, 200),
-                8: (200, 80, 30),
-                9: (40, 80, 180),
-                10: (180, 60, 20),
-                11: (100, 160, 240),
-                12: (240, 140, 60),
-                13: (200, 240, 255),
-                14: (255, 240, 200),
-                15: (100, 150, 255),
-                16: (32, 64, 96),
-                17: (255, 128, 0),
-                18: (192, 192, 192),
-                19: (200, 100, 50),
-                20: (80, 140, 220),
-                21: (220, 180, 80),
-                22: (204, 51, 102),
-                23: (255, 0, 150),
-                24: (210, 170, 140),
-                25: (100, 100, 100),
-                26: (255, 140, 0),
-                27: (128, 128, 128),
-                28: (200, 50, 50),
-                29: (0, 128, 0),
-                30: (255, 255, 0),
-                31: (0, 180, 255),
-                32: (255, 80, 80),
-                33: (0, 200, 150),
-                34: (255, 160, 60),
-                35: (0, 160, 200),
-                36: (240, 100, 40),
+        # If model has 37 classes, prefer explicit 37-class palette matching the training set
+        if getattr(self, "num_classes", None) == 37:
+            palette_37 = {
+                0: (0, 0, 0),       # background
+                1: (75, 0, 130),    # back_hair
+                2: (0, 102, 204),   # bottomwear
+                3: (100, 180, 220), # ears_left
+                4: (220, 120, 80),  # ears_right
+                5: (70, 120, 200),  # earwear_left
+                6: (220, 100, 40),  # earwear_right
+                7: (50, 100, 200),  # eyebrow_left
+                8: (200, 80, 30),   # eyebrow_right
+                9: (40, 80, 180),   # eyelash_left
+                10: (180, 60, 20),  # eyelash_right
+                11: (100, 160, 240),# eyewear_left
+                12: (240, 140, 60), # eyewear_right
+                13: (200, 240, 255),# eyewhite_left
+                14: (255, 240, 200),# eyewhite_right
+                15: (100, 150, 255),# face
+                16: (32, 64, 96),   # footwear
+                17: (255, 128, 0),  # front_hair
+                18: (192, 192, 192),# handwear
+                19: (200, 100, 50), # headwear
+                20: (80, 140, 220), # irides_left
+                21: (220, 180, 80), # irides_right
+                22: (204, 51, 102), # legwear
+                23: (255, 0, 150),  # mouth
+                24: (210, 170, 140),# neck
+                25: (100, 100, 100),# neckwear
+                26: (255, 140, 0),  # nose
+                27: (128, 128, 128),# objects
+                28: (200, 50, 50),  # tail
+                29: (0, 128, 0),    # topwear
+                30: (255, 255, 0),  # wings
+                31: (180, 100, 255),# handwear_L
+                32: (255, 140, 100),# handwear_R
+                33: (100, 200, 255),# legwear_L
+                34: (255, 200, 100),# legwear_R
+                35: (100, 255, 180),# footwear_L
+                36: (255, 100, 160),# footwear_R
             }
-            # apply palette_36 for matching class ids (clip extra ids)
-            for class_id in range(0, min(len(palette_36), int(getattr(self, "num_classes", len(self.id_to_color))) + 1)):
-                color = palette_36.get(class_id)
-                if color is not None:
+            for class_id, color in palette_37.items():
+                if class_id <= self.num_classes:
                     colored[preds == class_id] = color
         else:
             for class_id, color in self.id_to_color.items():
                 colored[preds == class_id] = color
 
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
+
+        depth_np = None
+        if "depth" in outputs:
+            depth_tensor = outputs["depth"]  # (B, 1, H, W)
+            depth_np = depth_tensor.detach().cpu().numpy()[0, 0]
+            # Resize depth to target size
+            if depth_np.shape != (target_h, target_w):
+                import cv2 as _cv2
+                depth_np = _cv2.resize(depth_np, (target_w, target_h), interpolation=_cv2.INTER_LINEAR)
 
         stored_source = source_img if (keep_source or output_overlay) else None
         class_names = getattr(self, "class_names", None)
@@ -252,6 +259,7 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
             color_map=color_map,
             class_names=list(class_names),
             id_to_color=dict(self.id_to_color),
+            depth=depth_np,
             _source_image=stored_source,
         )
 

@@ -23,6 +23,7 @@ class AnimeSegOutput:
     color_map: Image.Image
     class_names: List[str]
     id_to_color: Dict[int, Tuple[int, int, int]]
+    depth: Optional[np.ndarray] = None
     _source_image: Optional[Image.Image] = field(default=None, repr=False)
     _overlay: Optional[Image.Image] = field(default=None, repr=False)
 

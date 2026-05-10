@@ -76,12 +76,12 @@ SERIES_CLASS_MAP: Dict[str, List[str]] = {
         "tail",          # 28
         "topwear",       # 29
         "wings",         # 30
-        "body",          # 31 — exposed skin (arms/torso)
-        "lips",          # 32
-        "teeth",         # 33
-        "tongue",        # 34
-        "blush",         # 35
-        "hair_highlight",# 36
+        "handwear_L",    # 31
+        "handwear_R",    # 32
+        "legwear_L",     # 33
+        "legwear_R",     # 34
+        "footwear_L",    # 35
+        "footwear_R",    # 36
     ],
     # 12 classes — legacy early-training schema
     "legacy-v1": [

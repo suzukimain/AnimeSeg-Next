@@ -131,20 +131,18 @@ def _merge_one(entry: Dict, source_pipe, model_path: Path) -> str | None:
     arch = str(entry.get("Architecture", "")).lower()
 
     if arch == "mask2former":
-        # The underlying HF model is source_pipe.model.model
-        # But we use source_pipe.model.state_dict() to get the 'model.' prefix
-        state_dict = {k: v.detach().cpu().contiguous() for k, v in source_pipe.model.state_dict().items()}
+        # extract state dict from our wrapper model
+        # it contains 'model.*' (HF) and possibly 'depth_head.*' (Multitask)
+        full_sd = source_pipe.model.state_dict()
         
-        # Check if original checkpoint has extra heads (like depth_head)
-        # We need the original checkpoint path. source_pipe was loaded from entry['FilePath']
-        orig_path = ROOT / entry.get("FilePath", "")
-        if orig_path.exists():
-            from safetensors.torch import load_file as _load_safe
-            orig_sd = _load_safe(str(orig_path))
-            extra_keys = {k: v.detach().cpu().contiguous() for k, v in orig_sd.items() if k.startswith("depth_head.")}
-            if extra_keys:
-                print(f"[info] Preserving {len(extra_keys)} multitask keys (depth_head)")
-                state_dict.update(extra_keys)
+        state_dict = {}
+        for k, v in full_sd.items():
+            if k.startswith("model."):
+                # Remove 'model.' prefix for standard HF compatibility
+                state_dict[k[len("model."):]] = v.detach().cpu().contiguous()
+            else:
+                # Keep other keys (like depth_head.*) as is
+                state_dict[k] = v.detach().cpu().contiguous()
 
         save_file(state_dict, str(model_path))
 
@@ -208,10 +206,12 @@ def main() -> None:
             print(f"Skipping already merged model {index}: {file_path}")
             continue
 
-        # In AnimeSeg-Next, FilePath might be relative to ROOT or absolute
-        model_path = ROOT / file_path
-        if Path(file_path).is_absolute():
-            model_path = Path(file_path)
+        # Output paths: we always want to save to models/base/ for distribution
+        version = item.get("Version", index)
+        if version == 3:
+            model_path = ROOT / "models/base/depth/anime_seg-next_mask2former_v3.safetensors"
+        else:
+            model_path = ROOT / f"models/base/anime_seg-next_mask2former_v{version}.safetensors"
         
         model_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -279,6 +279,17 @@ def main() -> None:
         config_data = merged_cfg
 
     _save_json(config_path, config_data)
+    
+    # Also update FilePath to the new merged locations in the final config
+    final_config = _load_json(config_path)
+    for index, item in enumerate(final_config["models"]):
+        version = item.get("Version", index)
+        if version == 3:
+            item["FilePath"] = "models/base/depth/anime_seg-next_mask2former_v3.safetensors"
+        else:
+            item["FilePath"] = f"models/base/anime_seg-next_mask2former_v{version}.safetensors"
+    _save_json(config_path, final_config)
+
     print(f"[ok] updated config: {config_path}")
 
     for name, pixel_acc, miou in report:
