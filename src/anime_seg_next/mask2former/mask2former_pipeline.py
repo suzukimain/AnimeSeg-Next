@@ -195,10 +195,14 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
 
         stored_source = source_img if (keep_source or output_overlay) else None
+        class_names = getattr(self, "class_names", None)
+        if not class_names:
+            num_classes = int(getattr(self, "num_classes", len(self.id_to_color)))
+            class_names = [f"class_{i}" for i in range(num_classes)]
         result = AnimeSegOutput(
             segmentation_map=preds.astype(np.int32),
             color_map=color_map,
-            class_names=list(self.class_names),
+            class_names=list(class_names),
             id_to_color=dict(self.id_to_color),
             _source_image=stored_source,
         )
