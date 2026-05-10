@@ -226,24 +226,15 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
 
         input_tensor = self._preprocess(working_img)
 
-        h_in, w_in = input_tensor.shape[-2:]
-
         with torch.inference_mode():
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    raw = self.model.model(pixel_values=input_tensor)
+                    outputs = self.model(input_tensor)
             else:
-                raw = self.model.model(pixel_values=input_tensor)
-
-            # Match training _semantic_from_queries exactly:
-            # sigmoid BEFORE interpolate, drop no-object (last) class slot
-            cls_probs  = raw.class_queries_logits.softmax(dim=-1)[..., :-1]
-            mask_probs = F.interpolate(
-                raw.masks_queries_logits.sigmoid(),
-                size=(h_in, w_in), mode="bilinear", align_corners=False,
-            )
-            sem = torch.einsum("bqc,bqhw->bchw", cls_probs, mask_probs)
-            preds = sem.argmax(dim=1).cpu().numpy()[0]
+                outputs = self.model(input_tensor)
+            
+            # semantic_logits is already computed with einsum in model.forward
+            preds = torch.argmax(outputs["semantic_logits"], dim=1).cpu().numpy()[0]
 
         # Build coloured mask
         h, w = preds.shape
@@ -254,18 +245,8 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
 
         depth_np = None
-        depth_head = getattr(self.model, "depth_head", None)
-        if depth_head is not None:
-            with torch.inference_mode():
-                if self.use_amp:
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        depth_logits = depth_head(raw.pixel_decoder_last_hidden_state)
-                else:
-                    depth_logits = depth_head(raw.pixel_decoder_last_hidden_state)
-            depth_up = F.interpolate(
-                depth_logits, size=(h_in, w_in), mode="bilinear", align_corners=False
-            ).sigmoid()
-            depth_np = depth_up.cpu().numpy()[0, 0]
+        if "depth" in outputs:
+            depth_np = outputs["depth"].cpu().numpy()[0, 0]
             if depth_np.shape != (target_h, target_w):
                 import cv2 as _cv2
                 depth_np = _cv2.resize(depth_np, (target_w, target_h), interpolation=_cv2.INTER_LINEAR)
