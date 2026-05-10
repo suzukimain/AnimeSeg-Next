@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from anime_seg.mask2former.mask2former_pipeline import Mask2FormerAnimeSegPipeline
@@ -225,28 +226,46 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
 
         input_tensor = self._preprocess(working_img)
 
+        h_in, w_in = input_tensor.shape[-2:]
+
         with torch.inference_mode():
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    outputs = self.model(input_tensor)
+                    raw = self.model.model(pixel_values=input_tensor)
             else:
-                outputs = self.model(input_tensor)
-            preds = torch.argmax(outputs["semantic_logits"], dim=1).cpu().numpy()[0]
+                raw = self.model.model(pixel_values=input_tensor)
+
+            # Match training _semantic_from_queries exactly:
+            # sigmoid BEFORE interpolate, drop no-object (last) class slot
+            cls_probs  = raw.class_queries_logits.softmax(dim=-1)[..., :-1]
+            mask_probs = F.interpolate(
+                raw.masks_queries_logits.sigmoid(),
+                size=(h_in, w_in), mode="bilinear", align_corners=False,
+            )
+            sem = torch.einsum("bqc,bqhw->bchw", cls_probs, mask_probs)
+            preds = sem.argmax(dim=1).cpu().numpy()[0]
 
         # Build coloured mask
         h, w = preds.shape
         colored = np.zeros((h, w, 3), dtype=np.uint8)
-        # Use current id_to_color (already optimized in _resolve_class_colors)
         for class_id, color in self.id_to_color.items():
             colored[preds == class_id] = color
 
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
 
         depth_np = None
-        if "depth" in outputs:
-            depth_tensor = outputs["depth"]  # (B, 1, H, W)
-            depth_np = depth_tensor.detach().cpu().numpy()[0, 0]
-            # Resize depth to target size
+        depth_head = getattr(self.model, "depth_head", None)
+        if depth_head is not None:
+            with torch.inference_mode():
+                if self.use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        depth_logits = depth_head(raw.pixel_decoder_last_hidden_state)
+                else:
+                    depth_logits = depth_head(raw.pixel_decoder_last_hidden_state)
+            depth_up = F.interpolate(
+                depth_logits, size=(h_in, w_in), mode="bilinear", align_corners=False
+            ).sigmoid()
+            depth_np = depth_up.cpu().numpy()[0, 0]
             if depth_np.shape != (target_h, target_w):
                 import cv2 as _cv2
                 depth_np = _cv2.resize(depth_np, (target_w, target_h), interpolation=_cv2.INTER_LINEAR)
