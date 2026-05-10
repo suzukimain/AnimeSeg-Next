@@ -1,0 +1,137 @@
+name: Update HF config.json
+
+# Triggers:
+#  1. Automatic — when *.safetensors files are pushed to main
+#  2. Manual    — workflow_dispatch with explicit checkpoint name
+on:
+  push:
+    branches: [main]
+    paths:
+      - "models/*.safetensors"
+
+  workflow_dispatch:
+    inputs:
+      checkpoint_filename:
+        description: "Checkpoint filename inside HF repo (e.g. models/anime_seg_mask2former_v2.safetensors)"
+        required: true
+      version:
+        description: "Version number (integer)"
+        required: true
+        default: "1"
+      base_model:
+        description: "Base Mask2Former model ID"
+        required: false
+        default: "facebook/mask2former-swin-large-ade-semantic"
+      train_image_size:
+        description: "Training resolution (pixels)"
+        required: false
+        default: "768"
+
+env:
+  REPO_ID: suzukimain/AnimeSeg-Next
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  update-config:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # only read the repo; writes go to HF
+
+    steps:
+      # ------------------------------------------------------------------ #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need parent commit for diff
+
+      # ------------------------------------------------------------------ #
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install safetensors huggingface_hub
+          # Install the local package so series.py is importable
+          pip install -e src/library/AnimeSeg-Next --no-deps
+
+      # ------------------------------------------------------------------ #
+      # Resolve the list of checkpoints to process.
+      # push-based: detect changed .safetensors via git diff.
+      # manual:     use the provided filename (download from HF first).
+      # ------------------------------------------------------------------ #
+
+      - name: Resolve changed checkpoints (push trigger)
+        if: github.event_name == 'push'
+        id: push_ckpts
+        run: |
+          changed=$(git diff --name-only HEAD^ HEAD | grep '^models/.*\.safetensors$' || true)
+          echo "files=${changed//$'\n'/ }" >> "$GITHUB_OUTPUT"
+
+      - name: Download checkpoint from HF (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          hf_hub_download(
+              repo_id=os.environ["REPO_ID"],
+              filename="${{ inputs.checkpoint_filename }}",
+              token=os.environ["HF_TOKEN"],
+              local_dir=".",
+          )
+          PY
+
+      - name: Set checkpoint list (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        id: manual_ckpts
+        run: echo "files=${{ inputs.checkpoint_filename }}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------ #
+      - name: Download existing config.json from HF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          try:
+              hf_hub_download(
+                  repo_id=os.environ["REPO_ID"],
+                  filename="config.json",
+                  token=os.environ["HF_TOKEN"],
+                  local_dir=".",
+              )
+          except Exception:
+              pass   # config.json may not exist yet — script will create it
+          PY
+
+      # ------------------------------------------------------------------ #
+      - name: Update config.json
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Collect the checkpoint files (from whichever trigger fired)
+          CKPTS="${{ steps.push_ckpts.outputs.files }}${{ steps.manual_ckpts.outputs.files }}"
+          if [ -z "$CKPTS" ]; then
+            echo "No checkpoints to process — skipping."
+            exit 0
+          fi
+
+          VERSION="${{ inputs.version || '1' }}"
+          BASE_MODEL="${{ inputs.base_model || 'facebook/mask2former-swin-large-ade-semantic' }}"
+          SIZE="${{ inputs.train_image_size || '768' }}"
+
+          python scripts/update_hf_config.py \
+            $CKPTS \
+            --version "$VERSION" \
+            --base-model "$BASE_MODEL" \
+            --train-image-size "$SIZE" \
+            --push \
+            --repo-id "$REPO_ID" \
+            --token "$HF_TOKEN"

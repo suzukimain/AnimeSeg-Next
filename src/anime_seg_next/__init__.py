@@ -1,7 +1,13 @@
 """anime_seg_next public API."""
 
-from .mask2former.mask2former_pipeline import AnimeSegNextPipeline
+from .mask2former.mask2former_pipeline import AnimeSegNextPipeline, AnimeSegPipeline
+from .output import AnimeSegOutput
+from .series import SERIES_CLASS_MAP, build_semantic_colors
 
-AnimeSegPipeline = AnimeSegNextPipeline
-
-__all__ = ["AnimeSegNextPipeline", "AnimeSegPipeline"]
+__all__ = [
+    "AnimeSegNextPipeline",
+    "AnimeSegPipeline",
+    "AnimeSegOutput",
+    "SERIES_CLASS_MAP",
+    "build_semantic_colors",
+]
