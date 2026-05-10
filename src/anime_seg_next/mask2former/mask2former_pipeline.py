@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from anime_seg.mask2former.mask2former_pipeline import Mask2FormerAnimeSegPipeline
+
 from .mask2former_model import Mask2FormerAnimeSegModel
 from ..types import AnimeSegOutput
 from ..core import SERIES_CLASS_MAP, build_semantic_colors, resolve_series

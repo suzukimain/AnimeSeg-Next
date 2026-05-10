@@ -16,6 +16,9 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[1]
 # Try to find AnimeSeg sibling to add its src to path (required for base classes)
 ANIME_SEG_ROOT = ROOT.parent / "AnimeSeg"
+if not (ANIME_SEG_ROOT / "src").exists():
+    ANIME_SEG_ROOT = ROOT.parent.parent / "AnimeSeg"
+
 if (ANIME_SEG_ROOT / "src").exists():
     sys.path.insert(0, str(ANIME_SEG_ROOT / "src"))
 

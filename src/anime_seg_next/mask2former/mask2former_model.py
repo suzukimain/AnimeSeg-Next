@@ -157,7 +157,7 @@ class Mask2FormerAnimeSegModel(nn.Module):
         if self.depth_head is not None:
             # depth_head expects [B, Q, D] -> [B, Q, 1]
             # Then we weight the depth by mask probabilities
-            query_depth = self.depth_head(outputs.last_hidden_state) # [B, Q, 1]
+            query_depth = self.depth_head(outputs.transformer_decoder_last_hidden_state) # [B, Q, 1]
             
             # Weighted average depth based on masks
             # up_mask_probs: [B, Q, H, W]
