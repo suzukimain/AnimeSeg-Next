@@ -99,8 +99,21 @@ def build_entry(
         )
     merged_full = detect_merged_full(ckpt_path)
     series = _resolve_series(num_classes)
+    
+    # Normalize the checkpoint path to preserve directory structure
+    ckpt_path_obj = Path(ckpt_path)
+    if ckpt_path_obj.is_absolute():
+        # For absolute paths, use relative path from repo root
+        try:
+            rel_path = ckpt_path_obj.relative_to(Path.cwd())
+        except ValueError:
+            # If not relative to cwd, use the path as-is
+            rel_path = ckpt_path_obj
+    else:
+        rel_path = ckpt_path_obj
+    
     return {
-        "FilePath": f"models/{Path(ckpt_path).name}",
+        "FilePath": str(rel_path),
         "BaseModel": base_model,
         "TrainImageSize": train_image_size,
         "Architecture": "mask2former",
