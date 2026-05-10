@@ -87,3 +87,12 @@ class AnimeSegOutput:
             f"num_classes={self.num_classes}, "
             f"present={self.present_classes()})"
         )
+
+    @property
+    def images(self) -> list:
+        """Return image list for compatibility with callers expecting `.images[0]`.
+
+        By convention the first image is the color mask. Additional images
+        (overlay, etc.) may be provided in future.
+        """
+        return [self.color_map]

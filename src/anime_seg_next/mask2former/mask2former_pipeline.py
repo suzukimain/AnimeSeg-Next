@@ -171,6 +171,7 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
             )
 
         original_size = working_img.size
+        # If width/height not provided, keep original image size
         target_w = int(width) if width is not None else original_size[0]
         target_h = int(height) if height is not None else original_size[1]
         if target_w <= 0 or target_h <= 0:
@@ -189,8 +190,55 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         # Build coloured mask
         h, w = preds.shape
         colored = np.zeros((h, w, 3), dtype=np.uint8)
-        for class_id, color in self.id_to_color.items():
-            colored[preds == class_id] = color
+        # If model has 36 classes, prefer explicit 36-class palette
+        if getattr(self, "num_classes", None) == 36:
+            palette_36 = {
+                0: (0, 0, 0),
+                1: (75, 0, 130),
+                2: (0, 102, 204),
+                3: (100, 180, 220),
+                4: (220, 120, 80),
+                5: (70, 120, 200),
+                6: (220, 100, 40),
+                7: (50, 100, 200),
+                8: (200, 80, 30),
+                9: (40, 80, 180),
+                10: (180, 60, 20),
+                11: (100, 160, 240),
+                12: (240, 140, 60),
+                13: (200, 240, 255),
+                14: (255, 240, 200),
+                15: (100, 150, 255),
+                16: (32, 64, 96),
+                17: (255, 128, 0),
+                18: (192, 192, 192),
+                19: (200, 100, 50),
+                20: (80, 140, 220),
+                21: (220, 180, 80),
+                22: (204, 51, 102),
+                23: (255, 0, 150),
+                24: (210, 170, 140),
+                25: (100, 100, 100),
+                26: (255, 140, 0),
+                27: (128, 128, 128),
+                28: (200, 50, 50),
+                29: (0, 128, 0),
+                30: (255, 255, 0),
+                31: (0, 180, 255),
+                32: (255, 80, 80),
+                33: (0, 200, 150),
+                34: (255, 160, 60),
+                35: (0, 160, 200),
+                36: (240, 100, 40),
+            }
+            # apply palette_36 for matching class ids (clip extra ids)
+            for class_id in range(0, min(len(palette_36), int(getattr(self, "num_classes", len(self.id_to_color))) + 1)):
+                color = palette_36.get(class_id)
+                if color is not None:
+                    colored[preds == class_id] = color
+        else:
+            for class_id, color in self.id_to_color.items():
+                colored[preds == class_id] = color
 
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
 
