@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from huggingface_hub import hf_hub_download
 from anime_seg.mask2former.mask2former_pipeline import Mask2FormerAnimeSegPipeline
 
 from .mask2former_model import Mask2FormerAnimeSegModel
@@ -109,6 +110,13 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
     # ------------------------------------------------------------------ #
     # Constructor / factory                                                #
     # ------------------------------------------------------------------ #
+
+    def _download_hf_file(self, repo_id: str, filename: str, token: Optional[str]) -> str:
+        """Helper to download a file from HF with token support."""
+        # Fallback to parent if available, else direct hf_hub_download
+        if hasattr(super(), "_download_hf_file"):
+            return super()._download_hf_file(repo_id, filename, token)
+        return hf_hub_download(repo_id=repo_id, filename=filename, token=token)
 
     def __init__(
         self,
