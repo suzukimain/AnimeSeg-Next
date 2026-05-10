@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from .model import Mask2FormerModel
@@ -23,10 +22,13 @@ DEFAULT_INPUT_SIZE = 768
 
 
 class AnimeSegNextPipeline:
-    """Segmentation pipeline for AnimeSeg-Next models.
+    """Segmentation (+ depth) pipeline for AnimeSeg-Next.
 
-    Load with :meth:`from_pretrained` (HuggingFace Hub or local dir) or
-    :meth:`from_checkpoint` (direct path).
+    Factories
+    ---------
+    - :meth:`from_pretrained` — HuggingFace Hub (auto-selects latest checkpoint)
+    - :meth:`from_mask2former` — alias of ``from_pretrained`` (legacy name)
+    - :meth:`from_checkpoint` — local file path
 
     Example::
 
@@ -46,6 +48,7 @@ class AnimeSegNextPipeline:
         id_to_color: Dict[int, Tuple[int, int, int]],
         input_size: int = DEFAULT_INPUT_SIZE,
         device: str = "cpu",
+        remove_bg: bool = True,
     ) -> None:
         self.model = model
         self.class_names = class_names
@@ -53,6 +56,34 @@ class AnimeSegNextPipeline:
         self.input_size = input_size
         self.device = device
         self.use_amp = device.startswith("cuda")
+        self._bg_remover: Optional[Any] = None
+        self.remove_bg = remove_bg
+        if remove_bg:
+            self._init_bg_remover()
+
+    # ------------------------------------------------------------------
+    # Background remover
+    # ------------------------------------------------------------------
+
+    def _init_bg_remover(self) -> None:
+        """Lazy-load BgRemover (ISNet). Skips silently if unavailable."""
+        try:
+            from anime_seg.remove_bg.bg_remover_pipeline import BgRemover
+            self._bg_remover = BgRemover.from_single_file(device=self.device)
+        except Exception:
+            self._bg_remover = None
+
+    def _apply_bg_removal(self, img: Image.Image) -> Image.Image:
+        """Apply ISNet background removal; returns white-bg image."""
+        if self._bg_remover is None:
+            return img
+        img_np = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+        mask = self._bg_remover(img, use_amp=self.use_amp, return_mask=True, return_type="numpy")
+        if mask.ndim == 2:
+            mask = mask[:, :, np.newaxis]
+        bg = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        out = (mask * img_np + (1 - mask) * bg).clip(0, 1)
+        return Image.fromarray((out * 255).astype(np.uint8))
 
     # ------------------------------------------------------------------
     # Factory: HuggingFace Hub
@@ -64,53 +95,51 @@ class AnimeSegNextPipeline:
         repo_id: str = DEFAULT_REPO_ID,
         filename: str = "",
         token: Optional[str] = None,
+        hf_token: Optional[str] = None,
         device: Optional[str] = None,
         base_model: str = DEFAULT_BASE_MODEL,
         config_name: str = "config.json",
         input_size: int = DEFAULT_INPUT_SIZE,
+        remove_bg: bool = True,
     ) -> "AnimeSegNextPipeline":
         """Load from a HuggingFace Hub repo.
 
         Args:
             repo_id: HF repo ID or local directory.
             filename: Checkpoint filename; empty = auto-select latest *.safetensors.
-            token: HF access token.
-            device: Target device (``"cuda"``, ``"cpu"``). Defaults to auto-detect.
+            token / hf_token: HF access token (either accepted).
+            device: Target device. Defaults to CUDA if available.
             base_model: Swin backbone HF ID for architecture initialisation.
             config_name: Metadata JSON filename inside the repo.
             input_size: Square input resolution fed to the model.
-
-        Returns:
-            Loaded pipeline on the requested device.
+            remove_bg: Apply ISNet background removal before segmentation (default: True).
         """
         from huggingface_hub import hf_hub_download, list_repo_files
 
-        # Resolve checkpoint filename
+        final_token = hf_token or token
+
         if not filename:
             try:
-                files = list(list_repo_files(repo_id, token=token))
-                safetensors = [
-                    f for f in files if f.endswith(".safetensors")
-                ]
+                files = list(list_repo_files(repo_id, token=final_token))
+                safetensors = [f for f in files if f.endswith(".safetensors")]
                 if not safetensors:
                     raise RuntimeError(
                         f"No .safetensors files found in repo {repo_id!r}"
                     )
-                filename = safetensors[-1]  # latest by listing order
+                filename = safetensors[-1]
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to list files in repo {repo_id!r}: {exc}"
                 ) from exc
 
         ckpt_path = hf_hub_download(
-            repo_id=repo_id, filename=filename, token=token
+            repo_id=repo_id, filename=filename, token=final_token
         )
 
-        # Config (best-effort)
         config_obj: Optional[Dict] = None
         try:
             cfg_path = hf_hub_download(
-                repo_id=repo_id, filename=config_name, token=token
+                repo_id=repo_id, filename=config_name, token=final_token
             )
             with open(cfg_path, encoding="utf-8") as f:
                 config_obj = json.load(f)
@@ -123,7 +152,11 @@ class AnimeSegNextPipeline:
             base_model=base_model,
             input_size=input_size,
             device=device,
+            remove_bg=remove_bg,
         )
+
+    # Alias used by the merge script and old code
+    from_mask2former = from_pretrained
 
     # ------------------------------------------------------------------
     # Factory: local checkpoint
@@ -137,6 +170,7 @@ class AnimeSegNextPipeline:
         base_model: str = DEFAULT_BASE_MODEL,
         input_size: int = DEFAULT_INPUT_SIZE,
         device: Optional[str] = None,
+        remove_bg: bool = True,
     ) -> "AnimeSegNextPipeline":
         """Load from a local .safetensors or .pt file.
 
@@ -146,6 +180,7 @@ class AnimeSegNextPipeline:
             base_model: Swin backbone HF ID for architecture initialisation.
             input_size: Square input resolution fed to the model.
             device: Target device.
+            remove_bg: Apply ISNet background removal before segmentation (default: True).
         """
         config_obj: Optional[Dict] = None
         if config_path and os.path.isfile(config_path):
@@ -158,6 +193,7 @@ class AnimeSegNextPipeline:
             base_model=base_model,
             input_size=input_size,
             device=device,
+            remove_bg=remove_bg,
         )
 
     # ------------------------------------------------------------------
@@ -172,8 +208,8 @@ class AnimeSegNextPipeline:
         base_model: str,
         input_size: int,
         device: Optional[str],
+        remove_bg: bool = True,
     ) -> "AnimeSegNextPipeline":
-        # Determine num_classes from checkpoint shape
         num_classes = _infer_num_classes(ckpt_path)
 
         model = Mask2FormerModel(
@@ -194,6 +230,7 @@ class AnimeSegNextPipeline:
             id_to_color=id_to_color,
             input_size=input_size,
             device=target_device,
+            remove_bg=remove_bg,
         )
         pipe.to(target_device)
         return pipe
@@ -207,6 +244,11 @@ class AnimeSegNextPipeline:
         self.device = str(device)
         self.use_amp = self.device.startswith("cuda")
         self.model.to(device)
+        if self._bg_remover is not None:
+            try:
+                self._bg_remover.to(device)
+            except Exception:
+                pass
         return self
 
     # ------------------------------------------------------------------
@@ -220,6 +262,7 @@ class AnimeSegNextPipeline:
         height: Optional[int] = None,
         keep_source: bool = True,
         output_overlay: bool = False,
+        remove_bg: Optional[bool] = None,
     ) -> AnimeSegOutput:
         """Run segmentation on a single image.
 
@@ -229,6 +272,8 @@ class AnimeSegNextPipeline:
             height: Output height in pixels (defaults to source height).
             keep_source: Store source image for lazy overlay_map computation.
             output_overlay: Eagerly compute overlay_map.
+            remove_bg: Override the pipeline-level remove_bg setting for this call.
+                       ``None`` (default) uses the pipeline setting.
 
         Returns:
             :class:`AnimeSegOutput` with segmentation_map, color_map, and
@@ -244,7 +289,11 @@ class AnimeSegNextPipeline:
         if target_w <= 0 or target_h <= 0:
             raise ValueError("Output dimensions must be positive integers.")
 
-        input_tensor = self._preprocess(source_img)
+        # Background removal (before segmentation)
+        do_remove_bg = self.remove_bg if remove_bg is None else remove_bg
+        working_img = self._apply_bg_removal(source_img) if do_remove_bg else source_img
+
+        input_tensor = self._preprocess(working_img)
 
         with torch.inference_mode():
             if self.use_amp:
@@ -267,7 +316,7 @@ class AnimeSegNextPipeline:
         # Depth (optional)
         depth_np: Optional[np.ndarray] = None
         if "depth" in outputs:
-            depth_np = outputs["depth"].cpu().numpy()[0, 0]  # HxW float32
+            depth_np = outputs["depth"].cpu().numpy()[0, 0]
             if depth_np.shape != (target_h, target_w):
                 import cv2 as _cv2
                 depth_np = _cv2.resize(
@@ -313,10 +362,9 @@ def _infer_num_classes(ckpt_path: str) -> int:
         with safe_open(ckpt_path, framework="pt", device="cpu") as f:
             for k in f.keys():
                 if "class_predictor" in k and k.endswith(".weight"):
-                    return f.get_tensor(k).shape[0] - 1  # minus no-object
+                    return f.get_tensor(k).shape[0] - 1
     except Exception:
         pass
-    # pt/pth fallback
     try:
         import torch as _t
         sd = _t.load(ckpt_path, map_location="cpu")
@@ -330,4 +378,4 @@ def _infer_num_classes(ckpt_path: str) -> int:
                 return v.shape[0] - 1
     except Exception:
         pass
-    return 37  # sensible default
+    return 37

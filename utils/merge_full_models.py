@@ -1,73 +1,265 @@
+"""Merge a training checkpoint (delta weights) with the HF base model.
+
+Usage
+-----
+    python utils/merge_full_models.py \\
+        --checkpoint models/base/depth/step_0022000.safetensors \\
+        --output     models/base/depth/anime_seg-next_mask2former_v3.safetensors \\
+        --base-model facebook/mask2former-swin-large-ade-semantic \\
+        --validate   image/test-input/2.png
+
+The merged .safetensors file is self-contained (all weights included) and can be
+loaded with AnimeSegNextPipeline.from_checkpoint() without any HF download.
+
+Validation compares source-model output against merged-model output and checks
+pixel accuracy / mIoU to confirm no degradation occurred during the merge.
+"""
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import sys
-import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 ROOT = Path(__file__).resolve().parents[1]
-# Try to find AnimeSeg sibling to add its src to path (required for base classes)
-ANIME_SEG_ROOT = ROOT.parent / "AnimeSeg"
-if not (ANIME_SEG_ROOT / "src").exists():
-    ANIME_SEG_ROOT = ROOT.parent.parent / "AnimeSeg"
-
-if (ANIME_SEG_ROOT / "src").exists():
-    sys.path.insert(0, str(ANIME_SEG_ROOT / "src"))
-
-# Add AnimeSeg-Next src to path (SHOULD BE FIRST to override any duplicates in AnimeSeg)
 sys.path.insert(0, str(ROOT / "src"))
 
-try:
-    from anime_seg_next import AnimeSegNextPipeline  # noqa: E402
-except ImportError:
-    print("[error] Failed to import anime_seg_next. Make sure AnimeSeg and AnimeSeg-Next are in the same parent directory or installed.")
-    sys.exit(1)
+# Also try to locate anime_seg for BgRemover (optional, non-fatal if missing)
+for _candidate in [
+    ROOT.parent / "AnimeSeg" / "src",
+    ROOT.parent.parent / "AnimeSeg" / "src",
+]:
+    if _candidate.exists():
+        sys.path.insert(0, str(_candidate))
+        break
 
 
-def _load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+# ---------------------------------------------------------------------------
+# Core merge logic
+# ---------------------------------------------------------------------------
+
+def merge_checkpoint(
+    checkpoint_path: str,
+    base_model: str,
+    output_path: str,
+    num_classes: int = 37,
+) -> None:
+    """Load HF base model + training checkpoint and save merged safetensors.
+
+    The training checkpoint may contain:
+    - Only the fine-tuned keys (delta) in various prefix forms
+      (e.g. ``model.*``, no prefix, ``_orig_mod.*``)
+    - Additional heads (e.g. ``depth_head.*``)
+
+    All are resolved and merged into a single flat file where:
+    - HF model weights are stored **without** ``model.`` prefix
+    - Extra heads (depth_head, etc.) are stored as-is
+    """
+    try:
+        from transformers import (
+            Mask2FormerConfig,
+            Mask2FormerForUniversalSegmentation,
+        )
+    except ImportError as exc:
+        raise ImportError("pip install transformers") from exc
+
+    print(f"[1/4] Loading HF base model: {base_model}", flush=True)
+    config = Mask2FormerConfig.from_pretrained(base_model)
+    hf_model = Mask2FormerForUniversalSegmentation(config)
+
+    # Resize classifier if num_classes differs
+    if getattr(hf_model.config, "num_labels", None) != num_classes:
+        hidden_dim = int(getattr(hf_model.config, "hidden_dim", 256))
+        hf_model.config.num_labels = num_classes
+        hf_model.class_predictor = torch.nn.Linear(hidden_dim, num_classes + 1)
+
+    print(f"[2/4] Loading training checkpoint: {checkpoint_path}", flush=True)
+    ckpt_sd = _load_raw_state_dict(checkpoint_path)
+    ckpt_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt_sd.items()}
+
+    # Separate depth_head (and other extra heads) from HF weights
+    extra_keys = {k for k in ckpt_sd if not _is_hf_key(k)}
+    extra_sd: Dict[str, torch.Tensor] = {k: ckpt_sd[k] for k in extra_keys}
+
+    hf_ckpt = {k: v for k, v in ckpt_sd.items() if k not in extra_keys}
+
+    target_keys = set(hf_model.state_dict().keys())
+    hf_ckpt = _best_prefix_mapping(hf_ckpt, target_keys)
+
+    # Filter out shape-mismatched keys before loading (e.g. criterion.empty_weight
+    # changes shape between training config and base HF model — not used in inference)
+    hf_ref = hf_model.state_dict()
+    hf_ckpt_filtered = {
+        k: v for k, v in hf_ckpt.items()
+        if k in hf_ref and hf_ref[k].shape == v.shape
+    }
+    skipped = set(hf_ckpt.keys()) - set(hf_ckpt_filtered.keys())
+    if skipped:
+        print(f"  Skipped {len(skipped)} shape-mismatched keys: {sorted(skipped)[:5]}", flush=True)
+    hf_ckpt = hf_ckpt_filtered
+
+    # Load delta into base model
+    result = hf_model.load_state_dict(hf_ckpt, strict=False)
+    print(
+        f"  HF load: missing={len(result.missing_keys)} "
+        f"unexpected={len(result.unexpected_keys)}",
+        flush=True,
+    )
+    if result.missing_keys[:5]:
+        print(f"  missing sample: {result.missing_keys[:5]}", flush=True)
+
+    print("[3/4] Building merged state dict...", flush=True)
+    # Store HF weights WITHOUT model. prefix for maximum compatibility
+    merged: Dict[str, torch.Tensor] = {}
+    for k, v in hf_model.state_dict().items():
+        merged[k] = v.detach().cpu().contiguous()
+    # Append extra heads as-is
+    for k, v in extra_sd.items():
+        merged[k] = v.detach().cpu().contiguous()
+
+    print(f"[4/4] Saving → {output_path}", flush=True)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    save_file(merged, output_path)
+
+    # Also save HF config alongside output for easy pipeline loading
+    config_dir = Path(output_path).parent / "mask2former_merged_config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    hf_model.config.save_pretrained(str(config_dir))
+    print(f"  Config saved → {config_dir}", flush=True)
 
 
-def _save_json(path: Path, data: dict) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-        file.write("\n")
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_merge(
+    checkpoint_path: str,
+    merged_path: str,
+    val_image_path: str,
+    base_model: str = "facebook/mask2former-swin-large-ade-semantic",
+    min_pixel_acc: float = 0.99,
+    min_miou: float = 0.99,
+    device: Optional[str] = None,
+) -> Tuple[float, float]:
+    """Compare source-model vs merged-model output on a validation image.
+
+    Returns (pixel_acc, mIoU).  Raises RuntimeError if thresholds not met.
+    """
+    # Import here so merge_checkpoint() can be used standalone
+    from anime_seg_next import AnimeSegNextPipeline
+
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    img = Image.open(val_image_path).convert("RGB")
+
+    print("  Loading source model (training ckpt)...", flush=True)
+    src_pipe = AnimeSegNextPipeline.from_checkpoint(
+        checkpoint_path, device=dev, remove_bg=False
+    )
+    src_out = src_pipe(img, remove_bg=False)
+    src_mask = src_out.color_map
+
+    del src_pipe
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("  Loading merged model...", flush=True)
+    cfg_dir = str(Path(merged_path).parent / "mask2former_merged_config" / "config.json")
+    cfg_path = cfg_dir if Path(cfg_dir).exists() else None
+    merged_pipe = AnimeSegNextPipeline.from_checkpoint(
+        merged_path, config_path=cfg_path, device=dev, remove_bg=False
+    )
+    merged_out = merged_pipe(img, remove_bg=False)
+    merged_mask = merged_out.color_map
+
+    pixel_acc, miou = _mask_similarity(merged_mask, src_mask)
+    print(f"  pixel_acc={pixel_acc:.6f}  mIoU={miou:.6f}", flush=True)
+
+    if pixel_acc < min_pixel_acc or miou < min_miou:
+        raise RuntimeError(
+            f"Merged model quality below threshold: "
+            f"pixel_acc={pixel_acc:.4f} (min={min_pixel_acc}), "
+            f"mIoU={miou:.4f} (min={min_miou})"
+        )
+    return pixel_acc, miou
 
 
-def _write_temp_config(data: dict) -> Path:
-    # Use repo root for tmp if possible, otherwise ROOT
-    repo_root = ROOT.parents[2] if len(ROOT.parents) > 2 else ROOT
-    tmp_dir = repo_root / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="merge_cfg_next_", suffix=".json", dir=str(tmp_dir))
-    Path(tmp_name).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    Path(tmp_name).chmod(0o666)
-    Path(tmp_name).touch()
-    return Path(tmp_name)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_raw_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    pl = path.lower()
+    if pl.endswith(".safetensors"):
+        return dict(load_file(path))
+    if pl.endswith((".pt", ".pth")):
+        raw = torch.load(path, map_location="cpu")
+        if isinstance(raw, dict):
+            for key in ("state_dict", "model_state_dict", "model", "module"):
+                if isinstance(raw.get(key), dict):
+                    return dict(raw[key])
+            return dict(raw)
+        raise RuntimeError("Unsupported .pt/.pth checkpoint format")
+    raise RuntimeError(f"Unsupported checkpoint extension: {path}")
 
 
-def _mask_similarity(pred: Image.Image, ref: Image.Image) -> Tuple[float, float]:
+def _is_hf_key(k: str) -> bool:
+    """True if key belongs to the HF Mask2Former model (not an extra head)."""
+    EXTRA_PREFIXES = ("depth_head.",)
+    return not any(k.startswith(p) for p in EXTRA_PREFIXES)
+
+
+def _best_prefix_mapping(
+    sd: Dict[str, torch.Tensor],
+    target_keys: set,
+) -> Dict[str, torch.Tensor]:
+    def _strip(d: Dict, n: int) -> Dict:
+        out = {}
+        for k, v in d.items():
+            for _ in range(n):
+                if k.startswith("model."):
+                    k = k[len("model."):]
+            out[k] = v
+        return out
+
+    def _add(d: Dict, prefix: str) -> Dict:
+        return {prefix + k: v for k, v in d.items()}
+
+    candidates = {
+        "identity": sd,
+        "strip1": _strip(sd, 1),
+        "strip2": _strip(sd, 2),
+        "add_model": _add(sd, "model."),
+    }
+    best_name, best_n = "identity", -1
+    for name, cand in candidates.items():
+        n = len(target_keys.intersection(cand.keys()))
+        if n > best_n:
+            best_n, best_name = n, name
+    return candidates[best_name]
+
+
+def _mask_similarity(
+    pred: Image.Image, ref: Image.Image
+) -> Tuple[float, float]:
     pred_np = np.array(pred.convert("RGB"), dtype=np.uint8)
     ref_np = np.array(ref.convert("RGB"), dtype=np.uint8)
 
     if pred_np.shape != ref_np.shape:
         pred_np = np.array(
-            Image.fromarray(pred_np).resize((ref_np.shape[1], ref_np.shape[0]), Image.Resampling.NEAREST),
+            Image.fromarray(pred_np).resize(
+                (ref_np.shape[1], ref_np.shape[0]), Image.NEAREST
+            ),
             dtype=np.uint8,
         )
 
     flat_p = pred_np.reshape(-1, 3)
     flat_r = ref_np.reshape(-1, 3)
-
     pixel_acc = float(np.all(flat_p == flat_r, axis=1).mean())
 
     colors = np.unique(np.vstack([flat_p, flat_r]), axis=0)
@@ -78,225 +270,72 @@ def _mask_similarity(pred: Image.Image, ref: Image.Image) -> Tuple[float, float]
         union = np.logical_or(pm, rm).sum()
         if union == 0:
             continue
-        inter = np.logical_and(pm, rm).sum()
-        ious.append(float(inter / union))
-
+        ious.append(float(np.logical_and(pm, rm).sum() / union))
     miou = float(np.mean(ious)) if ious else 0.0
     return pixel_acc, miou
 
 
-def _sanitize_for_source(config_data: dict, idx: int) -> dict:
-    data = copy.deepcopy(config_data)
-    item = data["models"][idx]
-    cfg = item.get("Config", {})
-    if not isinstance(cfg, dict):
-        cfg = {}
-    cfg["merged_full"] = False
-    item["Config"] = cfg
-
-    arch = str(item.get("Architecture", "")).lower()
-    if arch == "mask2former":
-        base = str(item.get("BaseModel", ""))
-        # If it's a local path or custom, reset to default for source loading if we want to merge from HF base
-        if "/" in base and not base.startswith("facebook/"):
-             # Keep it if it's already a known HF model, otherwise fallback
-             pass
-    return data
-
-
-def _set_merged_flags(config_data: dict, idx: int, mask2former_config_relpath: str | None) -> dict:
-    data = copy.deepcopy(config_data)
-    item = data["models"][idx]
-    cfg = item.get("Config", {})
-    if not isinstance(cfg, dict):
-        cfg = {}
-    cfg["merged_full"] = True
-    item["Config"] = cfg
-
-    if mask2former_config_relpath is not None:
-        item["BaseModel"] = mask2former_config_relpath
-
-    return data
-
-
-def _create_source_pipe(arch: str, filename: str, config_path: Path, device: str):
-    if arch == "mask2former":
-        # AnimeSegNextPipeline.from_mask2former uses config_name (path or filename in repo)
-        return AnimeSegNextPipeline.from_mask2former(
-            repo_id="suzukimain/AnimeSeg-Next", # Dummy valid repo id
-            filename=filename, 
-            config_name=str(config_path)
-        ).to(device)
-    raise RuntimeError(f"Unsupported architecture: {arch}")
-
-
-def _merge_one(entry: Dict, source_pipe, model_path: Path) -> str | None:
-    arch = str(entry.get("Architecture", "")).lower()
-
-    if arch == "mask2former":
-        # extract state dict from our wrapper model
-        # it contains 'model.*' (HF) and possibly 'depth_head.*' (Multitask)
-        full_sd = source_pipe.model.state_dict()
-        
-        state_dict = {}
-        for k, v in full_sd.items():
-            if k.startswith("model."):
-                # Remove 'model.' prefix for standard HF compatibility
-                state_dict[k[len("model."):]] = v.detach().cpu().contiguous()
-            else:
-                # Keep other keys (like depth_head.*) as is
-                state_dict[k] = v.detach().cpu().contiguous()
-
-        save_file(state_dict, str(model_path))
-
-        config_dir = model_path.parent / "mask2former_merged_config"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        source_pipe.model.model.config.save_pretrained(str(config_dir))
-        
-        try:
-            return str(config_dir.relative_to(ROOT).as_posix())
-        except ValueError:
-            # Fallback to repo root or absolute
-            repo_root = ROOT.parents[2] if len(ROOT.parents) > 2 else ROOT
-            try:
-                return str(config_dir.relative_to(repo_root).as_posix())
-            except ValueError:
-                return str(config_dir.resolve().as_posix())
-
-    raise RuntimeError(f"Unsupported architecture: {arch}")
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Merge AnimeSeg-Next checkpoints into full single-file safetensors and validate similarity.")
-    parser.add_argument("--config", default="config.json", help="Path to model config JSON")
-    parser.add_argument("--image", default="../../../image/test-input/sample.png", help="Validation image path")
-    parser.add_argument("--min-miou", type=float, default=0.995, help="Minimum mIoU between source and merged outputs")
-    parser.add_argument("--min-acc", type=float, default=0.995, help="Minimum pixel accuracy between source and merged outputs")
+    parser = argparse.ArgumentParser(
+        description="Merge training checkpoint + HF base → single safetensors"
+    )
+    parser.add_argument(
+        "--checkpoint", required=True,
+        help="Training checkpoint path (.safetensors / .pt / .pth)"
+    )
+    parser.add_argument(
+        "--output", required=True,
+        help="Output .safetensors path"
+    )
+    parser.add_argument(
+        "--base-model",
+        default="facebook/mask2former-swin-large-ade-semantic",
+        help="HF base model ID for architecture",
+    )
+    parser.add_argument(
+        "--num-classes", type=int, default=37,
+        help="Number of segmentation classes (default: 37)"
+    )
+    parser.add_argument(
+        "--validate", metavar="IMAGE",
+        help="Path to a validation image. If given, runs pixel_acc/mIoU check."
+    )
+    parser.add_argument(
+        "--min-pixel-acc", type=float, default=0.99,
+        help="Minimum acceptable pixel accuracy (default: 0.99)"
+    )
+    parser.add_argument(
+        "--min-miou", type=float, default=0.99,
+        help="Minimum acceptable mIoU (default: 0.99)"
+    )
     args = parser.parse_args()
 
-    config_path = ROOT / args.config
-    val_image_path = ROOT / args.image
-    if not val_image_path.exists():
-        # Try absolute or relative from CWD
-        val_image_path = Path(args.image).resolve()
-        if not val_image_path.exists():
-            raise FileNotFoundError(f"Validation image not found: {args.image}")
+    merge_checkpoint(
+        checkpoint_path=args.checkpoint,
+        base_model=args.base_model,
+        output_path=args.output,
+        num_classes=args.num_classes,
+    )
+    print("[merge] Done.", flush=True)
 
-    config_data = _load_json(config_path)
-    models = config_data.get("models", [])
-    if not isinstance(models, list):
-        raise RuntimeError("Invalid model config format: 'models' must be a list")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    val_image = Image.open(val_image_path).convert("RGB")
-
-    print(f"device={device}")
-    print(f"validation_image={val_image_path}")
-
-    report: List[Tuple[str, float, float]] = []
-
-    for index, item in enumerate(models):
-        if not isinstance(item, dict):
-            continue
-
-        arch = str(item.get("Architecture", "")).lower()
-        file_path = str(item.get("FilePath", "")).strip()
-        if arch not in {"mask2former"} or not file_path:
-            continue
-
-        cfg = item.get("Config", {})
-        if cfg.get("merged_full"):
-            print(f"Skipping already merged model {index}: {file_path}")
-            continue
-
-        # Output paths: we always want to save to models/base/ for distribution
-        version = item.get("Version", index)
-        if version == 3:
-            model_path = ROOT / "models/base/depth/anime_seg-next_mask2former_v3.safetensors"
-        else:
-            model_path = ROOT / f"models/base/anime_seg-next_mask2former_v{version}.safetensors"
-        
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-
-        print(f"Processing model {index}: {file_path}")
-
-        source_cfg = _sanitize_for_source(config_data, index)
-        source_cfg_path = _write_temp_config(source_cfg)
-        
-        # Load source (which pulls base weights from HF if merged_full=False)
-        source_pipe = _create_source_pipe(arch, file_path, source_cfg_path, device)
-        source_output = source_pipe(val_image)
-        # Handle both AnimeSegOutput (with .color_map) and legacy Image return
-        source_mask = source_output.color_map if hasattr(source_output, "color_map") else source_output
-
-        # Merge and save to a temporary file first to avoid locking issues
-        temp_model_path = model_path.with_suffix(".tmp_safetensors")
-        merged_base = _merge_one(item, source_pipe, temp_model_path)
-        
-        # Close pipe/model if possible to release file handles
-        del source_pipe
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Reload as merged and validate
-        merged_cfg = _set_merged_flags(config_data, index, merged_base if arch == "mask2former" else None)
-        merged_cfg_path = _write_temp_config(merged_cfg)
-        
-        # We need to replace the original with the temp before loading the 'merged' pipe
-        # because the merged pipe will look for the file at model_path
-        if model_path.exists():
-             # We might need to wait or use a different approach if it's still locked
-             import os
-             import time
-             for _ in range(5):
-                 try:
-                     if model_path.exists():
-                         model_path.unlink()
-                     break
-                 except PermissionError:
-                     time.sleep(1)
-        temp_model_path.rename(model_path)
-
-        merged_pipe = _create_source_pipe(arch, file_path, merged_cfg_path, device)
-        merged_output = merged_pipe(val_image)
-        merged_mask = merged_output.color_map if hasattr(merged_output, "color_map") else merged_output
-
-        pixel_acc, miou = _mask_similarity(merged_mask, source_mask)
-        report.append((f"{arch}_v{item.get('Version', index)}", pixel_acc, miou))
-
-        # Save check image
-        repo_root = ROOT.parents[2] if len(ROOT.parents) > 2 else ROOT
-        out_mask_dir = repo_root / "tmp" / "img"
-        out_mask_dir.mkdir(parents=True, exist_ok=True)
-        out_mask = out_mask_dir / f"merged_check_next_{arch}_v{item.get('Version', index)}_mask.png"
-        merged_mask.save(out_mask)
-
-        print(f"[ok] {arch} merged -> {model_path}")
-        print(f"[ok] {arch} similarity pixel_acc={pixel_acc:.6f} mIoU={miou:.6f}")
-
-        if pixel_acc < args.min_acc or miou < args.min_miou:
-            print(f"[warning] Merged model quality check failed for {arch}: "
-                  f"pixel_acc={pixel_acc:.6f} (min={args.min_acc}), "
-                  f"mIoU={miou:.6f} (min={args.min_miou})")
-
-        config_data = merged_cfg
-
-    _save_json(config_path, config_data)
-    
-    # Also update FilePath to the new merged locations in the final config
-    final_config = _load_json(config_path)
-    for index, item in enumerate(final_config["models"]):
-        version = item.get("Version", index)
-        if version == 3:
-            item["FilePath"] = "models/base/depth/anime_seg-next_mask2former_v3.safetensors"
-        else:
-            item["FilePath"] = f"models/base/anime_seg-next_mask2former_v{version}.safetensors"
-    _save_json(config_path, final_config)
-
-    print(f"[ok] updated config: {config_path}")
-
-    for name, pixel_acc, miou in report:
-        print(f"[report] {name}: pixel_acc={pixel_acc:.6f}, mIoU={miou:.6f}")
+    if args.validate:
+        print(f"[validate] Running on {args.validate}...", flush=True)
+        pixel_acc, miou = validate_merge(
+            checkpoint_path=args.checkpoint,
+            merged_path=args.output,
+            val_image_path=args.validate,
+            base_model=args.base_model,
+            min_pixel_acc=args.min_pixel_acc,
+            min_miou=args.min_miou,
+        )
+        print(
+            f"[validate] PASS  pixel_acc={pixel_acc:.6f}  mIoU={miou:.6f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
