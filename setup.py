@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="anime_seg_next",
-    version="0.1.0",
-    description="AnimeSeg-Next: Anime Character Segmentation (Next Generation)",
+    version="0.2.0",
+    description="AnimeSeg-Next: Anime Character Segmentation and Depth Estimation",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="suzukimain",
@@ -13,13 +13,16 @@ setup(
     packages=find_packages(where="src"),
     include_package_data=True,
     install_requires=[
-        "anime_seg>=0.3.8",
         "torch>=2.0.0",
         "numpy",
         "Pillow",
         "huggingface_hub",
         "safetensors",
+        "transformers>=4.38.0",
     ],
+    extras_require={
+        "depth_resize": ["opencv-python"],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
