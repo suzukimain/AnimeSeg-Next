@@ -1,147 +1,182 @@
 # AnimeSeg-Next
 
-**高精度アニメキャラ分割パイプライン** — Mask2Former ベースの 31/37 クラスセマンティック・セグメンテーション
+<p>
+		<img src="https://visitor-badge.laobi.icu/badge?page_id=suzukimain.AnimeSeg-Next" alt="Visitor Badge">
+</p>
 
-## 概要
+Mask2Former をベースにしたアニメキャラクターのセマンティック・セグメンテーションライブラリです。
+`next-v1` / `next-v2` / `legacy-v1` のクラススキーマをサポートし、セマンティックな色付けと遅延オーバーレイ生成を提供します。
 
-`anime_seg_next` は、アニメキャラクターの詳細なパーツセグメンテーションを行う Python ライブラリです。
-30+ のクラス（髪、顔、衣装、アクセサリーなど）を自動認識し、セマンティック・カラーマップや座標クエリを提供します。
+## sample image
 
-### 主な特徴
+<!-- 必要ならここに実際のサンプル画像を追加してください -->
 
-- **複数シリーズ対応**: `next-v1` (31 クラス), `next-v2` (37 クラス), `legacy-v1` (12 クラス)
-- **セマンティック・カラー生成**: 左右対称クラスと意味論的な色を自動生成
-- **リッチな出力型**: 遅延生成オーバーレイ、ピクセルレベルのクエリ機能
-- **モデル自動検出**: 重みファイルから class count で シリーズを自動判定
+## Installation
 
-## クイックスタート
+```bash
+pip install -e .
+```
+
+## Usage
 
 ```python
-from anime_seg_next import AnimeSegNextPipeline, AnimeSegOutput
+from anime_seg_next import AnimeSegNextPipeline
 
-# パイプラインのロード（デフォルト: Hugging Face）
-pipeline = AnimeSegNextPipeline.from_pretrained("suzukimain/AnimeSeg-Next")
+pipe = AnimeSegNextPipeline.from_mask2former().to("cuda")
+mask = pipe("path/to/image.jpg")
+mask.save("output.png")
 
-# 推論
-image = Image.open("character.png")
-output: AnimeSegOutput = pipeline(image)
-
-# 結果にアクセス
-print(f"クラス数: {output.num_classes}")
-print(f"検出されたクラス: {output.present_classes()}")
-
-# 特定クラスのマスク取得
-face_mask = output.class_mask("face")
-hair_mask = output.class_mask("back_hair")
-
-# 座標クエリ
-class_name = output.class_name_at(row=100, col=150)
-
-# オーバーレイ表示（ソース画像を背後に）
-overlay = output.overlay_map
-overlay.save("result_overlay.png")
+overlay = pipe("path/to/image.jpg", output_overlay=True)
+overlay.overlay_map.save("overlay.png")
 ```
 
-## パッケージ構成
-
-```
-anime_seg_next/
-  __init__.py           # 公開 API
-  mask2former/
-	__init__.py
-	mask2former_pipeline.py  # AnimeSegNextPipeline 実装
-  
-  types/                # 型定義
-	__init__.py
-	output.py           # AnimeSegOutput クラス
-  
-  core/                 # コア機能
-	__init__.py
-	series.py           # シリーズメタデータ & セマンティック色生成
-```
-
-## API リファレンス
-
-### AnimeSegNextPipeline
+### AnimeSeg-Next
 
 ```python
-class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
-	"""Mask2Former ベースのアニメセグメンテーション・パイプライン"""
-    
-	@classmethod
-	def from_pretrained(cls, model_id: str, **kwargs) -> AnimeSegNextPipeline:
-		"""事前学習済みモデルをロード"""
-    
-	def __call__(
-		self,
-		image: Image.Image,
-		keep_source: bool = True,
-	) -> AnimeSegOutput:
-		"""推論実行"""
+from anime_seg_next import AnimeSegNextPipeline
+
+pipe = AnimeSegNextPipeline.from_mask2former().to("cuda")
+mask = pipe("path/to/image.jpg")
+mask.save("output.png")
 ```
 
-### AnimeSegOutput
+If the Hugging Face repo is private or gated, pass `token="hf_..."` or set `HF_TOKEN`.
+`AnimeSegNextPipeline()` の直接呼び出しよりも `from_mask2former()` の利用を推奨します。
+
+## Optional: output size
 
 ```python
-@dataclass
-class AnimeSegOutput:
-	"""セグメンテーション結果オブジェクト"""
-    
-	segmentation_map: np.ndarray          # H×W int32 クラス ID
-	color_map: Image.Image                # RGB カラーマップ
-	class_names: List[str]                # クラス名リスト
-	id_to_color: Dict[int, Tuple[...]]   # クラス ID → RGB
-    
-	@property
-	def overlay_map(self) -> Image.Image:
-		"""ソース画像に 60/40 ブレンドしたオーバーレイ"""
-    
-	def class_name_at(self, row: int, col: int) -> str:
-		"""(row, col) のピクセルのクラス名を取得"""
-    
-	def class_mask(self, class_name_or_id: str | int) -> np.ndarray:
-		"""単一クラスのブール型マスク取得"""
-    
-	def present_classes(self) -> List[str]:
-		"""セグメンテーション内に実際に存在するクラスの名前リスト"""
+# Same as input size (default)
+mask_same = pipe("path/to/image.jpg")
+
+# Fixed output size
+mask_fixed = pipe("path/to/image.jpg", width=1024, height=1024)
+
+# Width/height can be specified independently
+mask_w = pipe("path/to/image.jpg", width=1024)
+mask_h = pipe("path/to/image.jpg", height=1024)
 ```
 
-### シリーズとクラス定義
-
-#### next-v1 (31 クラス)
+## Advanced Usage
 
 ```python
-from anime_seg_next import SERIES_CLASS_MAP
+from PIL import Image
 
-next_v1_classes = SERIES_CLASS_MAP["next-v1"]
-# ['background', 'back_hair', 'bottomwear', 'ears_left', 'ears_right', ...]
+img = Image.open("image.jpg")
+mask = pipe(img)
+mask.save("output.png")
+
+# Overlay is available when keep_source=True (default)
+result = pipe(img, keep_source=True)
+result.overlay_map.save("overlay.png")
 ```
 
-- **顔**: face, nose, mouth, 眉毛, 目（白・瞳）
-- **髪**: back_hair, front_hair
-- **衣装**: topwear, bottomwear, footwear
-- **アクセサリー**: headwear, neckwear, earwear, eyewear, handwear
-- **その他**: body, tail, wings, objects
+## Model Files
 
-#### next-v2 (37 クラス)
+Models should follow the naming convention:
 
-next-v1 に加え以下の詳細クラスを追加：
-- lips, teeth, tongue, blush, hair_highlight
+```
+models/anime_seg_next_{architecture}_v{version}.safetensors
+```
 
-## セマンティック色生成
+Example:
+- `models/anime_seg_next_mask2former_v1.safetensors`
 
-色は以下のルールで自動生成されます：
+For AnimeSeg-Next, store Mask2Former metadata in `config.json` under `Config` with `num_classes`, `class_names`, and optionally `class_colors`.
 
-1. **background** → 黒 (0, 0, 0)
-2. **ハードコード上書き** → 意味的に重要なクラス（irides: 青など）
-3. **左右対**: 同じ hue、right は補色 (+180°)
-4. **back_ 接頭辞** → 暗くなる (val × 0.55)
-5. **front_ 接頭辞** → 明るくなる (val × 1.0)
-6. **その他** → 黄金比間隔 HSV
+```json
+{
+		"models": [
+				{
+						"FilePath": "models/anime_seg_next_mask2former_v1.safetensors",
+						"TrainImageSize": 768,
+						"Version": 1,
+						"Architecture": "mask2former",
+						"BaseModel": "facebook/mask2former-swin-large-ade-semantic",
+						"Config": {
+								"merged_full": true,
+								"series": "next-v1",
+								"num_classes": 31,
+								"class_names": [
+										"background",
+										"back_hair",
+										"bottomwear",
+										"ears_left",
+										"ears_right",
+										"earwear_left",
+										"earwear_right",
+										"eyebrow_left",
+										"eyebrow_right",
+										"eyelash_left",
+										"eyelash_right",
+										"eyewear_left",
+										"eyewear_right",
+										"eyewhite_left",
+										"eyewhite_right",
+										"face",
+										"footwear",
+										"front_hair",
+										"handwear",
+										"headwear",
+										"irides_left",
+										"irides_right",
+										"legwear",
+										"mouth",
+										"neck",
+										"neckwear",
+										"nose",
+										"objects",
+										"tail",
+										"topwear",
+										"wings"
+								]
+						}
+				}
+		]
+}
+```
+
+If `num_classes` is omitted, the loader can infer it from the checkpoint's class head. If `class_colors` is omitted, it is generated deterministically.
+
+## Segmentation Classes and Mask Colors
+
+`next-v1` returns **31 classes** and `next-v2` returns **37 classes**.
+
+### next-v1 highlights
+
+- Face: `face`, `nose`, `mouth`, `eyebrow_left`, `eyebrow_right`, `eyelash_left`, `eyelash_right`
+- Hair: `back_hair`, `front_hair`
+- Clothes: `topwear`, `bottomwear`, `legwear`, `footwear`
+- Accessories: `headwear`, `neckwear`, `earwear_left`, `earwear_right`, `eyewear_left`, `eyewear_right`, `handwear`
+
+### next-v2 additions
+
+- `body`, `lips`, `teeth`, `tongue`, `blush`, `hair_highlight`
+
+## Troubleshooting
+
+### `RuntimeError: "source image not available"`
+
+`overlay_map` を使うには、`keep_source=True` のまま推論してください。
 
 ```python
-from anime_seg_next import build_semantic_colors
-
-colors = build_semantic_colors(["background", "face", "back_hair", "front_hair"])
-# {0: (0, 0, 0), 1: (242, 100, 120), 2: (80, 40, 60), 3: (180, 120, 200), ...}
+result = pipe("path/to/image.jpg", keep_source=True)
+result.overlay_map.save("overlay.png")
 ```
+
+### `KeyError: "Unknown class"`
+
+クラス名が正確か確認してください。クラス一覧は `SERIES_CLASS_MAP` または `docs/CLASSES.md` を参照してください。
+
+## 技術仕様
+
+- **バックボーン**: Mask2Former
+- **出力**: `AnimeSegOutput`
+- **クラス解決**: `series` → `num_classes` → `class_names`
+- **色生成**: セマンティック HSV + 左右対称ルール
+
+## Reference
+
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [CLASSES.md](docs/CLASSES.md)
+- [API_REFERENCE.md](docs/API_REFERENCE.md)
