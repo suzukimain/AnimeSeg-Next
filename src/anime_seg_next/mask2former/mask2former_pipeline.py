@@ -54,9 +54,55 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
     def _resolve_class_colors(
         config_obj: Dict, num_classes: int
     ) -> Dict[int, Tuple[int, int, int]]:
-        """Generate semantic colors from resolved class names."""
+        """Generate semantic colors: fixed 37-class palette or dynamic semantic colors."""
+        if num_classes == 37:
+            return AnimeSegNextPipeline.get_fixed_37_palette()
+        
         names = AnimeSegNextPipeline._resolve_class_names(config_obj, num_classes)
         return build_semantic_colors(names)
+
+    @staticmethod
+    def get_fixed_37_palette() -> Dict[int, Tuple[int, int, int]]:
+        """Definitive 37-class palette matching the training ground truth."""
+        return {
+            0: (0, 0, 0),       # background
+            1: (75, 0, 130),    # back_hair
+            2: (0, 102, 204),   # bottomwear
+            3: (100, 180, 220), # ears_left
+            4: (220, 120, 80),  # ears_right
+            5: (70, 120, 200),  # earwear_left
+            6: (220, 100, 40),  # earwear_right
+            7: (50, 100, 200),  # eyebrow_left
+            8: (200, 80, 30),   # eyebrow_right
+            9: (40, 80, 180),   # eyelash_left
+            10: (180, 60, 20),  # eyelash_right
+            11: (100, 160, 240),# eyewear_left
+            12: (240, 140, 60), # eyewear_right
+            13: (200, 240, 255),# eyewhite_left
+            14: (255, 240, 200),# eyewhite_right
+            15: (100, 150, 255),# face
+            16: (32, 64, 96),   # footwear
+            17: (255, 128, 0),  # front_hair
+            18: (192, 192, 192),# handwear
+            19: (200, 100, 50), # headwear
+            20: (80, 140, 220), # irides_left
+            21: (220, 180, 80), # irides_right
+            22: (204, 51, 102), # legwear
+            23: (255, 0, 150),  # mouth
+            24: (210, 170, 140),# neck
+            25: (100, 100, 100),# neckwear
+            26: (255, 140, 0),  # nose
+            27: (128, 128, 128),# objects
+            28: (200, 50, 50),  # tail
+            29: (0, 128, 0),    # topwear
+            30: (255, 255, 0),  # wings
+            31: (180, 100, 255),# handwear_L
+            32: (255, 140, 100),# handwear_R
+            33: (100, 200, 255),# legwear_L
+            34: (255, 200, 100),# legwear_R
+            35: (100, 255, 180),# footwear_L
+            36: (255, 100, 160),# footwear_R
+        }
 
     # ------------------------------------------------------------------ #
     # Constructor / factory                                                #
@@ -190,53 +236,9 @@ class AnimeSegNextPipeline(Mask2FormerAnimeSegPipeline):
         # Build coloured mask
         h, w = preds.shape
         colored = np.zeros((h, w, 3), dtype=np.uint8)
-        # If model has 37 classes, prefer explicit 37-class palette matching the training set
-        if getattr(self, "num_classes", None) == 37:
-            palette_37 = {
-                0: (0, 0, 0),       # background
-                1: (75, 0, 130),    # back_hair
-                2: (0, 102, 204),   # bottomwear
-                3: (100, 180, 220), # ears_left
-                4: (220, 120, 80),  # ears_right
-                5: (70, 120, 200),  # earwear_left
-                6: (220, 100, 40),  # earwear_right
-                7: (50, 100, 200),  # eyebrow_left
-                8: (200, 80, 30),   # eyebrow_right
-                9: (40, 80, 180),   # eyelash_left
-                10: (180, 60, 20),  # eyelash_right
-                11: (100, 160, 240),# eyewear_left
-                12: (240, 140, 60), # eyewear_right
-                13: (200, 240, 255),# eyewhite_left
-                14: (255, 240, 200),# eyewhite_right
-                15: (100, 150, 255),# face
-                16: (32, 64, 96),   # footwear
-                17: (255, 128, 0),  # front_hair
-                18: (192, 192, 192),# handwear
-                19: (200, 100, 50), # headwear
-                20: (80, 140, 220), # irides_left
-                21: (220, 180, 80), # irides_right
-                22: (204, 51, 102), # legwear
-                23: (255, 0, 150),  # mouth
-                24: (210, 170, 140),# neck
-                25: (100, 100, 100),# neckwear
-                26: (255, 140, 0),  # nose
-                27: (128, 128, 128),# objects
-                28: (200, 50, 50),  # tail
-                29: (0, 128, 0),    # topwear
-                30: (255, 255, 0),  # wings
-                31: (180, 100, 255),# handwear_L
-                32: (255, 140, 100),# handwear_R
-                33: (100, 200, 255),# legwear_L
-                34: (255, 200, 100),# legwear_R
-                35: (100, 255, 180),# footwear_L
-                36: (255, 100, 160),# footwear_R
-            }
-            for class_id, color in palette_37.items():
-                if class_id <= self.num_classes:
-                    colored[preds == class_id] = color
-        else:
-            for class_id, color in self.id_to_color.items():
-                colored[preds == class_id] = color
+        # Use current id_to_color (already optimized in _resolve_class_colors)
+        for class_id, color in self.id_to_color.items():
+            colored[preds == class_id] = color
 
         color_map = Image.fromarray(colored).resize((target_w, target_h), Image.NEAREST)
 

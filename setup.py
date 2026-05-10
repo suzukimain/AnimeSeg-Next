@@ -4,7 +4,7 @@ setup(
     name="anime_seg_next",
     version="0.1.0",
     description="AnimeSeg-Next: Anime Character Segmentation (Next Generation)",
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="suzukimain",
     author_email="gt13579552@gmail.com",
